@@ -6,15 +6,17 @@ your live Tasqr state next to the session basics:
 
     Fable | llm_task_tracker main | ctx 42% | ▶ Fix lease reclaim…
 
-Tasqr data is served from a local cache (~/.cache/tasqr-statusline) and
-refreshed by a detached background process, so rendering never blocks on the
-network and the API sees at most a few read requests per minute while you are
-actively working. Zero dependencies beyond the Python 3 standard library.
+Rendering never touches the network. Tasqr data is served from a local cache
+(~/.cache/tasqr-statusline), refreshed by a detached background process —
+one at a time per queue, and none at all without an API key or under
+`refresh = manual` — so the API sees at most a few read requests per minute
+while you are actively working. Zero dependencies beyond the Python 3
+standard library.
 
 Credentials are read from TASQR_API_KEY, or the same INI file the tasqr-mcp
 proxy uses (~/.config/tasqr/credentials, profile selected by TASQR_PROFILE).
 
-Settings (tags, theme, style, segments, ttl) resolve in layers: a global
+Settings (tags, theme, style, segments, ttl, refresh) resolve in layers: a global
 config file, then this project's entry in projects.conf, then a
 .tasqr-statusline file in the project directory, then TASQR_STATUSLINE_*
 environment variables. Later layers win.
@@ -42,10 +44,11 @@ TTL = int(os.environ.get("TASQR_STATUSLINE_TTL", "60"))  # task-list refresh, se
 QUOTA_TTL = 300  # quota changes slowly; don't spend requests on it
 ME_TTL = 3600  # your email effectively never changes
 STALE_AFTER = 600  # cache older than this renders a stale marker
+LOCK_STALE = 60  # a refresh holding the lock longer than this is presumed dead
 TITLE_MAX = 44
 HTTP_TIMEOUT = 5
 
-SETTING_KEYS = ("tags", "theme", "style", "segments", "ttl")
+SETTING_KEYS = ("tags", "theme", "style", "segments", "ttl", "refresh")
 
 
 def cache_dir() -> Path:
@@ -261,6 +264,13 @@ def read_credentials() -> tuple[str | None, str]:
     return api_key or None, (api_url or DEFAULT_API_URL).rstrip("/")
 
 
+def has_credentials() -> bool:
+    """Whether a key is configured at all. The render path asks before it
+    claims the queue is merely loading: with nothing to authenticate, a
+    refresh would only ever discover the same thing."""
+    return read_credentials()[0] is not None
+
+
 # ---------------------------------------------------------------------------
 # Settings — layered: global config < projects.conf < project file < env
 
@@ -406,6 +416,9 @@ def load_settings(project_dir: str | None) -> dict:
         "style": merged.get("style") or None,
         "segments": segments,
         "ttl": ttl,
+        # "manual" is the opt-out: nothing is ever spawned, and the snapshot
+        # is only as fresh as the last --refresh the user ran.
+        "refresh": "manual" if merged.get("refresh", "").strip().lower() == "manual" else "auto",
     }
 
 
@@ -440,9 +453,63 @@ def needs_refresh(cache: dict, now: float, ttl: int | None = None) -> bool:
     return now - last_attempt > (ttl or TTL)
 
 
-def spawn_refresh(tags: list[str]) -> None:
-    """Kick a detached refresh; rendering never waits on the network."""
-    args = [sys.executable, os.path.abspath(__file__), "--refresh"]
+def lock_path(tags: list[str]) -> Path:
+    """The in-progress marker for one queue's refresh, beside its snapshot."""
+    return cache_path(tags).with_suffix(".lock")
+
+
+def acquire_lock(tags: list[str]) -> str | None:
+    """Claim the right to refresh this queue, or return None if a live refresh
+    already holds it. A refresh only writes the cache when it finishes, so
+    until then every render still reads a stale snapshot and would spawn
+    another process; the lock is what makes those ticks cheap no-ops.
+
+    A lock older than LOCK_STALE belonged to a process that died without
+    releasing it, and is taken over."""
+    path = lock_path(tags)
+    token = os.urandom(8).hex()
+    for attempt in (1, 2):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            if attempt == 2:
+                return None  # lost the race to another render
+            try:
+                if time.time() - path.stat().st_mtime < LOCK_STALE:
+                    return None
+                path.unlink()
+            except OSError:
+                return None
+            continue
+        except OSError:
+            # Nowhere to write the lock means nowhere to write the snapshot
+            # either, so a refresh would have nothing to show for itself.
+            return None
+        with os.fdopen(fd, "w") as f:
+            f.write(token)
+        return token
+    return None
+
+
+def release_lock(tags: list[str], token: str) -> None:
+    """Drop the lock, but only if it is still the one we took: a stale-lock
+    takeover means someone else's refresh may own the file by now."""
+    path = lock_path(tags)
+    try:
+        if path.read_text() == token:
+            path.unlink()
+    except OSError:
+        pass
+
+
+def spawn_refresh(tags: list[str]) -> bool:
+    """Kick a detached refresh; rendering never waits on the network. At most
+    one runs per queue — the child releases the lock when it exits."""
+    token = acquire_lock(tags)
+    if token is None:
+        return False
+    args = [sys.executable, os.path.abspath(__file__), "--refresh", "--lock=" + token]
     if tags:
         args.append("--tags=" + ",".join(tags))
     try:
@@ -452,8 +519,11 @@ def spawn_refresh(tags: list[str]) -> None:
             )
     except OSError:
         # No subprocess available (restricted container, process limit). Render
-        # from whatever snapshot exists; the next render retries the spawn.
-        pass
+        # from whatever snapshot exists; the next render retries the spawn, so
+        # the lock must not outlive the attempt.
+        release_lock(tags, token)
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -722,10 +792,12 @@ def tasqr_segments(
     styled modes, kind picks the label or decoration the chip and layout styles
     put on it; plain style ignores both (the inline codes in text carry the
     color)."""
+    if cache.get("error") == "no_key" or (not cache and not has_credentials()):
+        # Nothing is configured, so nothing is loading. Name what would turn
+        # the queue on and let the session segments carry the line.
+        return [(f"{s.dim}tasqr: set TASQR_API_KEY{s.reset}", "dim", "status")]
     if not cache:
         return [(f"{s.dim}tasqr …{s.reset}", "dim", "status")]
-    if cache.get("error") == "no_key":
-        return [(f"{s.dim}tasqr: no api key{s.reset}", "dim", "status")]
     if "active" not in cache:
         # Refreshes have run but never succeeded — don't claim the queue is empty.
         return [(f"{s.dim}tasqr: unavailable{s.reset}", "dim", "status")]
@@ -1010,10 +1082,19 @@ def main() -> None:
     argv = sys.argv[1:]
     if "--refresh" in argv:
         tags: list[str] = []
+        token = None
         for arg in argv:
             if arg.startswith("--tags="):
                 tags = parse_tags(arg[len("--tags=") :])
-        refresh(tags)
+            elif arg.startswith("--lock="):
+                token = arg[len("--lock=") :]
+        try:
+            refresh(tags)
+        finally:
+            # Only a spawned refresh holds a lock; one the user runs by hand
+            # must leave a background refresh's lock where it found it.
+            if token:
+                release_lock(tags, token)
         return
 
     try:
@@ -1027,7 +1108,11 @@ def main() -> None:
     settings = load_settings(project_dir)
     now = time.time()
     cache = load_cache(settings["tags"])
-    if needs_refresh(cache, now, settings["ttl"]):
+    if (
+        settings["refresh"] == "auto"
+        and needs_refresh(cache, now, settings["ttl"])
+        and has_credentials()  # nothing to authenticate with, nothing to fetch
+    ):
         spawn_refresh(settings["tags"])
     style = Style(theme=resolve_theme(settings["theme"]), enabled=_want_color())
     print(

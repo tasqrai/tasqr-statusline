@@ -20,6 +20,7 @@ state:
 | `tasks 87%` | Monthly task quota (shown only at 80% or above; never shown on unmetered plans) |
 | `(stale)` | The snapshot is over 10 minutes old (network trouble, or Tasqr unreachable) |
 | `tasqr: unavailable` | Refreshes have run but none has succeeded yet |
+| `tasqr: set TASQR_API_KEY` | No key configured — the rest of the line still renders |
 | `main*` | Git branch, starred when the working tree is dirty |
 
 A title longer than its window scrolls marquee-style, advancing one column per second as the
@@ -39,7 +40,8 @@ next, what's stuck — on the status line, so checking it costs a glance instead
 switch.
 
 It assumes you are already running Tasqr. Without a key the session segments still render and the
-task segments read `tasqr: no api key`; see *Credentials* below.
+task segments read `tasqr: set TASQR_API_KEY`; nothing is refreshed until one is configured. See
+*Credentials* below.
 
 Single-file Python, standard library only. No pip install, no Node.
 
@@ -82,10 +84,27 @@ the same file. An exported `TASQR_API_KEY` **always wins** over the file; if you
 in your shell profile, either remove it or wrap the command as
 `env -u TASQR_API_KEY python3 …`.
 
+## Network access
+
+The status line talks to one host:
+
+| Host | When | What it sends |
+|---|---|---|
+| `api.tasqr.ai` (or whatever `TASQR_API_URL` points at) | Background refreshes only, at most once per TTL (default 60s) | Your API key in an `X-Api-Key` header |
+
+Refreshes are read-only: `GET /me` (hourly), `GET /tasks` for the in-progress, pending and
+blocked lists, and `GET /quota` (every 5 minutes). Nothing is written to Tasqr, and nothing but
+those requests leaves the machine — no telemetry, no third-party endpoint.
+
+**Rendering never touches the network.** Every request comes from a `--refresh` run, so if you
+want a status line that makes no requests at all, either leave `TASQR_API_KEY` unset (the line
+falls back to the session segments) or set `refresh = manual` and never run the refresh. See
+*Refreshing without a background process*.
+
 ## Settings
 
-Every setting (`tags`, `theme`, `style`, `segments`, `ttl`) can live in any of four layers.
-Later layers win:
+Every setting (`tags`, `theme`, `style`, `segments`, `ttl`, `refresh`) can live in any of four
+layers. Later layers win:
 
 1. **Global config** at `~/.config/tasqr-statusline/config`: your defaults everywhere.
    ```
@@ -113,7 +132,8 @@ Later layers win:
    ```
    tags = faultline
    ```
-4. **Environment variables**: `TASQR_STATUSLINE_TAGS`, `_THEME`, `_STYLE`, `_SEGMENTS`, `_TTL`.
+4. **Environment variables**: `TASQR_STATUSLINE_TAGS`, `_THEME`, `_STYLE`, `_SEGMENTS`, `_TTL`,
+   `_REFRESH`.
    An empty `TASQR_STATUSLINE_TAGS` explicitly disables any file-based filter.
 
 The project directory comes from the Claude Code session, so two concurrent sessions in different
@@ -278,6 +298,32 @@ directly. Renders read a snapshot from `~/.cache/tasqr-statusline/` and, when it
 actively working, nothing when you are not. Failed refreshes keep serving the last good snapshot
 and back off for a full TTL.
 
+Only one refresh runs at a time per tag filter. A refresh writes its snapshot when it finishes,
+so until then the cache still reads as stale — without a guard, every tick during a slow fetch
+would spawn another process. The spawning render takes a lock (`cache*.lock`, beside the
+snapshot) and later ticks see it and do nothing; the refresh drops the lock when it exits, and a
+lock left behind by a killed process is taken over after `LOCK_STALE` (60) seconds. Nothing is
+spawned at all when no API key is configured, or when `refresh = manual`.
+
+### Refreshing without a background process
+
+If you would rather nothing was ever spawned from your status line, set `refresh = manual` in any
+settings layer:
+
+```
+refresh = manual
+```
+
+Renders then only ever read the cache, and the snapshot is as fresh as the last `--refresh` you
+ran. Keep it current with cron, launchd, or any scheduler you already have:
+
+```cron
+* * * * * cd /path/to/tasqr-statusline && /usr/bin/python3 tasqr_statusline.py --refresh
+```
+
+The trade-off is that a scheduler that stops firing looks exactly like a quiet queue until the
+snapshot is old enough to show `(stale)`.
+
 ## Configuration
 
 | Variable | Default | Purpose |
@@ -285,6 +331,7 @@ and back off for a full TTL.
 | `TASQR_PROFILE` | `default` | Profile section in the credentials file |
 | `TASQR_API_KEY` / `TASQR_API_URL` | — | Override the credentials file entirely |
 | `TASQR_STATUSLINE_TTL` | `60` | Seconds between background refreshes |
+| `TASQR_STATUSLINE_REFRESH` | `auto` | `manual` never spawns a refresh (see *How it stays cheap*) |
 | `TASQR_STATUSLINE_TAGS` | — | Tag filter (see *Scoping to a project*) |
 | `TASQR_STATUSLINE_THEME` | auto | `light`, `dark`, `ansi` or `dracula`; auto-detects from Claude Code settings |
 | `TASQR_STATUSLINE_SEGMENTS` | `model,dir,ctx,tasqr` | Segment list and order (see *Choosing segments*) |
@@ -299,7 +346,7 @@ the cause:
 | The line says | What it means | What to do |
 |---|---|---|
 | `tasqr …` | No snapshot yet — the first render after install | Nothing; a background refresh fills it within a TTL |
-| `tasqr: no api key` | No key in the environment or the credentials file | See *Credentials*; check `TASQR_PROFILE` if you use profiles |
+| `tasqr: set TASQR_API_KEY` | No key in the environment or the credentials file, so no refresh is attempted | See *Credentials*; check `TASQR_PROFILE` if you use profiles |
 | `tasqr: unavailable` | Refreshes have run, none has succeeded | Refresh in the foreground, then read the error (below) |
 | `(stale)` | The snapshot is over 10 minutes old | Refreshes are failing, or the machine was asleep |
 | `tasqr: queue empty` when you expect work | Usually a tag filter narrower than the tasks | Re-run with `TASQR_STATUSLINE_TAGS=` to confirm |

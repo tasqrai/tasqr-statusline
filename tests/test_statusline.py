@@ -13,6 +13,7 @@ portability, config resolution, the cache/refresh cycle, credentials, and the
 logic that depends on the clock.
 """
 
+import io
 import json
 import os
 import sys
@@ -32,6 +33,10 @@ if hasattr(time, "tzset"):
     time.tzset()
 
 GOLDEN_PATH = Path(__file__).with_name("golden.json")
+
+# Base mocks has_credentials so no test depends on the developer's own
+# ~/.config/tasqr credentials; keep a handle on the real one to test it.
+REAL_HAS_CREDENTIALS = sl.has_credentials
 
 # Longer than TITLE_MAX (44) but shorter than PANEL_TITLE_MAX (56), so the
 # goldens show the one-line styles truncating a title the panel prints whole.
@@ -114,7 +119,11 @@ class Base(unittest.TestCase):
         for key in sl.SETTING_KEYS:
             os.environ.pop(f"TASQR_STATUSLINE_{key.upper()}", None)
         os.environ.pop("NO_COLOR", None)
-        for fn, value in (("git_branch", "main"), ("git_dirty", True)):
+        for fn, value in (
+            ("git_branch", "main"),
+            ("git_dirty", True),
+            ("has_credentials", True),
+        ):
             patcher = mock.patch.object(sl, fn, return_value=value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -200,7 +209,10 @@ class SettingsTests(Base):
         self.assertEqual(sl.parse_settings_text("faultline\n"), {"tags": "faultline"})
         self.assertEqual(
             sl.load_settings(str(self.project)),
-            {"tags": [], "theme": None, "style": None, "segments": None, "ttl": sl.TTL},
+            {
+                "tags": [], "theme": None, "style": None, "segments": None,
+                "ttl": sl.TTL, "refresh": "auto",
+            },
         )
 
         (self.confdir / "config").write_text("style = bubble\ntheme = dark\nttl = 300\n")
@@ -215,6 +227,16 @@ class SettingsTests(Base):
 
         (self.project / ".tasqr-statusline").write_text("ttl = soon\n")
         self.assertEqual(sl.load_settings(str(self.project))["ttl"], sl.TTL)
+
+        # Refresh mode resolves through the same layers, and anything that
+        # isn't the documented "manual" leaves the background refresh on.
+        (self.project / ".tasqr-statusline").write_text("refresh = manual\n")
+        self.assertEqual(sl.load_settings(str(self.project))["refresh"], "manual")
+        with mock.patch.dict(os.environ, {"TASQR_STATUSLINE_REFRESH": "auto"}):
+            self.assertEqual(sl.load_settings(str(self.project))["refresh"], "auto")
+        (self.project / ".tasqr-statusline").write_text("refresh = sometimes\n")
+        self.assertEqual(sl.load_settings(str(self.project))["refresh"], "auto")
+        (self.project / ".tasqr-statusline").unlink()
 
         (self.confdir / "projects.conf").write_text(
             f"[{self.project}]\ntags = micro\nsegments = dir,tasqr\n"
@@ -373,12 +395,90 @@ class RefreshTests(Base):
         self.assertGreater(cache["failed_at"], time.time() - 5)
 
     def test_a_blocked_spawn_does_not_break_the_render(self):
-        # A sandbox may forbid subprocesses; rendering must survive it.
+        # A sandbox may forbid subprocesses; rendering must survive it, and a
+        # spawn that never happened must not leave a lock behind to wedge the
+        # next attempt for a full LOCK_STALE window.
         with mock.patch.object(
             sl.subprocess, "Popen", side_effect=OSError(1, "Operation not permitted")
         ):
+            self.assertFalse(sl.spawn_refresh([]))
+            self.assertFalse(sl.spawn_refresh(["chore"]))
+        self.assertFalse(sl.lock_path([]).exists())
+        self.assertFalse(sl.lock_path(["chore"]).exists())
+
+    def test_only_one_refresh_is_in_flight_per_queue(self):
+        # The refresh writes the cache when it finishes, so until then every
+        # render still sees a stale cache. Without a lock each of those ticks
+        # spawns another process.
+        with mock.patch.object(sl.subprocess, "Popen") as popen:
+            self.assertTrue(sl.spawn_refresh([]))
+            self.assertFalse(sl.spawn_refresh([]))
+            self.assertFalse(sl.spawn_refresh([]))
+            self.assertEqual(popen.call_count, 1)
+            # A different tag filter is a different queue and its own snapshot.
+            self.assertTrue(sl.spawn_refresh(["chore"]))
+            self.assertEqual(popen.call_count, 2)
+        self.assertTrue(sl.lock_path([]).exists())
+
+    def test_a_stale_lock_does_not_wedge_the_refresh_forever(self):
+        # A refresh killed mid-flight leaves its lock behind.
+        lock = sl.lock_path([])
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text("from-a-dead-process")
+        os.utime(lock, (0, time.time() - sl.LOCK_STALE - 1))
+        with mock.patch.object(sl.subprocess, "Popen") as popen:
+            self.assertTrue(sl.spawn_refresh([]))
+        self.assertEqual(popen.call_count, 1)
+        self.assertNotEqual(lock.read_text(), "from-a-dead-process")
+
+    def test_a_refresh_releases_its_own_lock_and_leaves_a_stranger_alone(self):
+        with mock.patch.object(sl.subprocess, "Popen") as popen:
             sl.spawn_refresh([])
-            sl.spawn_refresh(["chore"])
+        argv = [a for a in popen.call_args[0][0] if a.startswith("--lock=")]
+        self.assertEqual(len(argv), 1, "the spawned refresh is told which lock it holds")
+
+        self.run_refresh(argv)
+        self.assertFalse(sl.lock_path([]).exists())
+
+        # A refresh the user runs by hand must not release a lock held by a
+        # background one, and neither must a spawn whose lock was reclaimed.
+        sl.lock_path([]).write_text("someone-else")
+        self.run_refresh([])
+        self.run_refresh(["--lock=not-the-one-on-disk"])
+        self.assertEqual(sl.lock_path([]).read_text(), "someone-else")
+
+    def run_refresh(self, extra):
+        """The --refresh entry point, as the spawned process runs it."""
+        with (
+            mock.patch.object(sys, "argv", ["tasqr_statusline.py", "--refresh", *extra]),
+            mock.patch.object(sl, "read_credentials", return_value=(None, "https://api")),
+        ):
+            sl.main()
+
+    def test_a_render_only_spawns_a_refresh_when_it_can_use_one(self):
+        conf = Path(self.tmp.name) / "conf"
+        conf.mkdir(exist_ok=True)
+        cases = [
+            ("a key and the default mode", {}, True, 1),
+            ("refresh = manual", {"TASQR_STATUSLINE_REFRESH": "manual"}, True, 0),
+            ("no credentials to use", {}, False, 0),
+        ]
+        for name, env, configured, spawns in cases:
+            with self.subTest(name):
+                sl.cache_path([]).unlink(missing_ok=True)
+                sl.lock_path([]).unlink(missing_ok=True)
+                with (
+                    mock.patch.dict(os.environ, env),
+                    mock.patch.object(sl, "config_dir", return_value=conf),
+                    mock.patch.object(sl, "has_credentials", return_value=configured),
+                    mock.patch.object(sys, "argv", ["tasqr_statusline.py"]),
+                    mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload()))),
+                    mock.patch.object(sys, "stdout", io.StringIO()) as out,
+                    mock.patch.object(sl.subprocess, "Popen") as popen,
+                ):
+                    sl.main()
+                self.assertEqual(popen.call_count, spawns)
+                self.assertIn("Fable", out.getvalue())  # the line still renders
 
     def test_refresh_without_a_key_records_why(self):
         with mock.patch.object(sl, "read_credentials", return_value=(None, "https://api")):
@@ -405,6 +505,9 @@ class CredentialTests(Base):
                 self.assertEqual(sl.read_credentials(), ("k-work", sl.DEFAULT_API_URL))
             with mock.patch.object(sl, "credentials_path", return_value=Path(tmp) / "nope"):
                 self.assertEqual(sl.read_credentials(), (None, sl.DEFAULT_API_URL))
+                self.assertFalse(REAL_HAS_CREDENTIALS())
+        with mock.patch.dict(os.environ, {"TASQR_API_KEY": "k-env"}):
+            self.assertTrue(REAL_HAS_CREDENTIALS())
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +530,20 @@ class LogicTests(Base):
 
         # A wrapping title must not read as extra fields on the meters line.
         self.assertNotEqual(sl.METERS_SEP.strip(), sl.MARQUEE_GAP.strip())
+
+    def test_without_credentials_the_line_says_how_to_turn_it_on(self):
+        # The gallery sandbox has no key and no cache: an ellipsis reads as a
+        # broken line, so say what is missing and let the session segments
+        # carry the rest.
+        with mock.patch.object(sl, "has_credentials", return_value=False):
+            segs = sl.tasqr_segments({}, NOW, PLAIN)
+            self.assertEqual([kind for _, _, kind in segs], ["status"])
+            self.assertIn("TASQR_API_KEY", segs[0][0])
+            # A refresh that ran and found no key says the same thing.
+            no_key = sl.tasqr_segments({"fetched_at": NOW, "error": "no_key"}, NOW, PLAIN)
+            self.assertEqual(no_key[0][0], segs[0][0])
+        # With a key, an empty cache is just a first refresh still in flight.
+        self.assertNotIn("TASQR_API_KEY", sl.tasqr_segments({}, NOW, PLAIN)[0][0])
 
     def test_gauges_escalate_with_pressure_and_plain_numbers_stay_quiet(self):
         # Gauges use the ok/warn/alert ramp; bare percentages use dim/warn/alert.
